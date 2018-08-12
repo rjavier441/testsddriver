@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <string.h> // strncmp()
 
+#define DEBUG 0
 #define CMDMAX 50
 #define BUS_TIMEOUT 50
 
@@ -15,7 +16,14 @@
 const int pinCS = 10;
 
 typedef struct {
-    uint8_t response[6];
+    union {
+        uint64_t qWord;
+        struct {
+            uint32_t hi;
+            uint32_t lo;
+        } dWord;
+        uint8_t byte[8];
+    } data;
     uint8_t length;
 } SdResponse;
 
@@ -36,6 +44,16 @@ typedef enum {
     SDXC
 } SdType;
 
+typedef struct {
+    union {
+        uint32_t dWord;
+        uint16_t word[2];
+        uint8_t byte[4];
+    } ocr;
+    SdType type;
+    SdResponse response;
+} SdCard;
+
 typedef enum {
     IS_DUAL_VOLTAGE   = 7,   // OCR bit 7: Supports Low Voltage Ranges AND High Voltage Ranges
     IS_2_7V_TO_2_8V   = 15,  // OCR bit 15: Supports 2.7V-2.8V
@@ -54,19 +72,21 @@ typedef enum {
 
 typedef enum {    // NOTE: OR'ing of b0100_0000 is meant to conform with the SD protocol (i.e. first bits must be b01)
     GARBAGE     = 0xFF,         // Garbage command; instructs sendCmd() to send out the data and even the checksum as 0xFF
-    RESET       = 0x40 | 0x00,  // 0: reset the sd card (force it to go to the idle state)
-    INIT        = 0x40 | 0x01,  // 1: starts an initiation of the card
-    GETOP       = 0x40 | 0x08,  // 8: request the sd card's support of the provided host's voltage ranges
-    GETSTATUS   = 0x04 | 13,    // 13: get status register
-    ACBEGIN     = 0x40 | 0x37,  // 55: the leading command for/signals the start of an application-specific command
-    ACINIT      = 0x40 | 0x29,  // 41: newer version of CMD1: starts an initiation of the card
-    GETOCR      = 0x40 | 0x3A,  // 58: request data from the operational conditions register
-    CHGBL       = 0x40 | 0x10,  // 16: change block length (only effective in SDSC cards)
-    READ        = 0x40 | 0x11,  // 17: read a block of data
-    WRITE       = 0x40 | 0x18,  // 24: write a block of data
-    DELFROM     = 0x40 | 0x20,  // 32: signal the start block for deletion
-    DELTO       = 0x40 | 0x21,  // 33: signal the end block for deletion
-    DEL         = 0x40 | 0x26   // 38: begin deletion from the block range specified by the [DELFROM : DELTO] commands
+    RESET       = 0x40 | 0,     // CMD0: reset the sd card (force it to go to the idle state)
+    INIT        = 0x40 | 1,     // CMD1: starts an initiation of the card
+    GET_OP      = 0x40 | 8,     // CMD8: request the sd card's support of the provided host's voltage ranges
+    GET_STATUS  = 0x04 | 13,    // CMD13: get status register
+    CHG_BLK_LEN = 0x40 | 16,    // CMD16: change block length (only effective in SDSC cards)
+    READ_BLK    = 0x40 | 17,    // CMD17: read a single block of data
+    READ_BLKS   = 0x40 | 18,    // CMD18: read many blocks of data until CMD12 is sent
+    WRITE_BLK   = 0x40 | 24,    // CMD24: write a single block of data
+    WRITE_BLKS  = 0x40 | 25,    // CMD25: write many blocks of data until CMD12 (?) is sent
+    DEL_FROM    = 0x40 | 32,    // CMD32: set address of the start block for deletion
+    DEL_TO      = 0x40 | 33,    // CMD33: set address of the end block for deletion
+    DEL         = 0x40 | 38,    // CMD38: begin deletion from the block range specified by the [DEL_FROM : DEL_TO] commands
+    ACBEGIN     = 0x40 | 55,    // CMD55: signals the start of an application-specific command
+    GETOCR      = 0x40 | 58     // CMD58: request data from the operational conditions register
+    ACINIT      = 0x40 | 41,    // ACMD41: application-specific version of CMD1 (must precede with CMD55)
 } SdCommand;
 
 
@@ -177,33 +197,39 @@ unsigned char getCRC(unsigned char message[], int length)
 
 
 
-int getCrc(uint64_t fiveBytes){
-  int crc = 0x00;
-  int generator = ((fiveBytes >> 7) & 0x01) + ((fiveBytes >> 3) & 0x01) + 1;
-  int mx = 0x00;
+//int getCrc(uint64_t fiveBytes){
+//  int crc = 0x00;
+//  int generator = ((fiveBytes >> 7) & 0x01) + ((fiveBytes >> 3) & 0x01) + 1;
+//  int mx = 0x00;
+//
+//  // Calculate M(x)
+//  for (int i = 0; i < 40; i++) {
+//    int a = (fiveBytes >> i) & 0x01;  // get the current (i'th) bit
+//    int b = (fiveBytes & (0x01 << (39-i))) >> (39-i);
+//    mx += a*b;
+//  }
+//
+//  // Calculate the CRC7 code
+//  crc = (mx * ((fiveBytes >> 7) & 0x01)) % generator;
+//  return crc;
+//}
 
-  // Calculate M(x)
-  for (int i = 0; i < 40; i++) {
-    int a = (fiveBytes >> i) & 0x01;  // get the current (i'th) bit
-    int b = (fiveBytes & (0x01 << (39-i))) >> (39-i);
-    mx += a*b;
-  }
-
-  // Calculate the CRC7 code
-  crc = (mx * ((fiveBytes >> 7) & 0x01)) % generator;
-  return crc;
-}
 
 
-
-// @returns     on success: the number of bytes in the response
-//              on error: -1
+// @function        sendCmd()
+// @description     sends a command frame to the SD Card and sets the response
+// @parameter       (SdCommand) sdc                 the command code to send as the first byte
+//                  (uint32_t) arg                  the 4-byte argument for the command
+//                  ~(uint8_t*) responseBuffer      pointer to a buffer to house the response frame
+//                  ~(int) delay                    delay (ms) between asserting CS and sending a command frame
+//                  ~(bool) keepAlive               determines whether to de-assert CS after receiving response
+// @returns         on success: the number of bytes in the response
+//                  on error: -1
 int sendCmd(SdCommand sdc, uint32_t arg, uint8_t responseBuffer[] = NULL, int delay = 0, bool keepAlive = false) {
     SdResponseType resType;
     int resLen = 0;
     int crc = 0x00;
     int tries = 0;
-    //uint8_t responseQueue[6];
     uint8_t bitOffset = 0;  // determines the distance of the response's 0 bit from the MSB place
     uint8_t tempByte = 0;
 
@@ -212,19 +238,23 @@ int sendCmd(SdCommand sdc, uint32_t arg, uint8_t responseBuffer[] = NULL, int de
         case GARBAGE: resType = R1; break;
         case RESET: resType = R1; break;
         case INIT: resType = R1; break;
-        case GETOP: resType = R7; break;
-        case GETSTATUS: resType = R2; break;
+        case GET_OP: resType = R7; break;
+        case GET_STATUS: resType = R2; break;
         case ACBEGIN: resType = R1; break;
         case ACINIT: resType = R1; break;
         case GETOCR: resType = R3; break;
-        case CHGBL: resType = R1; break;
-        case READ: resType = R1; break;
-        case WRITE: resType = R1; break;
-        case DELFROM: resType = R1; break;
-        case DELTO: resType = R1; break;
+        case CHG_BLK_LEN: resType = R1; break;
+        case READ_BLK: resType = R1; break;
+        case READ_BLKS: resType = R1; break;
+        case WRITE_BLK: resType = R1; break;
+        case WRITE_BLKS: resType = R1; break;
+        case DEL_FROM: resType = R1; break;
+        case DEL_TO: resType = R1; break;
         case DEL: resType = R1b; break;
         default:
+            #if DEBUG
             Serial.println("Error: unknown response type. Aborting...");
+            #endif
             return -1;
             break;
     }
@@ -255,14 +285,6 @@ int sendCmd(SdCommand sdc, uint32_t arg, uint8_t responseBuffer[] = NULL, int de
     }
 
     // Send the desired command frame to the SD card board
-    /*
-    responseQueue[0] = (uint8_t) SPI.transfer( sdc );                          // begin by transfering the command byte
-    responseQueue[1] = (uint8_t) SPI.transfer( (int) (arg >> 24) & 0xFF );     // send argument byte [31:24]
-    responseQueue[2] = (uint8_t) SPI.transfer( (int) (arg >> 16) & 0xFF );     // send argument byte [23:16]
-    responseQueue[3] = (uint8_t) SPI.transfer( (int) (arg >> 8) & 0xFF );      // send argument byte [15:8]
-    responseQueue[4] = (uint8_t) SPI.transfer( (int) (arg >> 0) & 0xFF );      // send argument byte [7:0]
-    responseQueue[5] = (uint8_t) SPI.transfer( (int) (crc << 1) | 0x01 );      // send 7-bit CRC and LSB stop addr (as b1)
-    */
     SPI.transfer( sdc );                          // begin by transfering the command byte
     SPI.transfer( (int) (arg >> 24) & 0xFF );     // send argument byte [31:24]
     SPI.transfer( (int) (arg >> 16) & 0xFF );     // send argument byte [23:16]
@@ -309,14 +331,6 @@ int sendCmd(SdCommand sdc, uint32_t arg, uint8_t responseBuffer[] = NULL, int de
 
     // Only write to the response buffer if it is provided
     if (responseBuffer != NULL) {
-        /*
-        responseBuffer[0] = responseQueue[0];   // MSB
-        responseBuffer[1] = responseQueue[1];
-        responseBuffer[2] = responseQueue[2];
-        responseBuffer[3] = responseQueue[3];
-        responseBuffer[4] = responseQueue[4];
-        responseBuffer[5] = responseQueue[5];
-        */
         for (int i = 0; i < resLen; i++) {
             responseBuffer[i] = (uint8_t) ( tempResponse >> 8 * (resLen - 1 - i) );
         }
@@ -332,6 +346,202 @@ int sendCmd(SdCommand sdc, uint32_t arg, uint8_t responseBuffer[] = NULL, int de
 
 
 
+// @function        initializeSdCard()
+// @description     runs the SD Card initialization sequence
+// @parameter       (SdCard*) sd - a pointer to the SD Card structure
+// @returns         on init success: true
+//                  on init failure: false
+bool initializeSdCard (SdCard* sd) {
+    //SdResponse res;
+    //SdType sdType;
+    int tries = 0;
+    bool cardIsIdle = false;
+
+
+
+    // Reset the card and force it to go to idle state at <400kHz with a CMD0 + (active-low) CS
+    #if DEBUG
+    Serial.println("Sending SD Card to Idle State...");
+    #endif
+    sd->response.length = sendCmd(RESET, 0x00, sd->response.data.byte, 100, true);            // Reset the SD card
+
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+
+
+
+    // Reset the card again to trigger SPI mode
+    #if DEBUG
+    Serial.print("Initializing SPI mode...");
+    #endif
+    do {
+        tries++;
+        #if DEBUG
+        Serial.print("Attempt #");
+        Serial.println(tries);
+        #endif
+        sd->response.length = sendCmd(RESET, 0x00, sd->response.data.byte, 100, true);            // Reset the SD card
+        
+
+        // Check if R1 response frame's bit 1 is set (to ensure that card is in idle state)
+        if (sd->response.data.byte[0] & 0x01 == 0x01) {
+            // If it is, we can move on; otherwise, keep trying for a set amount of tries
+            cardIsIdle = true;
+        }
+        delay(1000);
+    } while (tries < BUS_TIMEOUT && !cardIsIdle);
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+    if (tries >= BUS_TIMEOUT) {
+        #if DEBUG
+        Serial.println("Error: failed to initiate SPI mode within timeout. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    }
+
+
+
+    // Send the host's supported voltage (3.3V) and ask if the card supports it
+    #if DEBUG
+    Serial.println("Checking Current SD Card Voltage Level...");
+    #endif
+    unsigned int checkPattern = 0xAB;
+    uint64_t supportedVoltage = 0x00000001;
+    sd->response.length = sendCmd(GET_OP, (supportedVoltage << 8) | checkPattern, sd->response.data.byte, 100, true);
+
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+    if (sd->response.data.byte[4] != checkPattern) {
+        // If the last byte is not an exact echo of the LSB of the GET_OP command's argument, this
+        // response is invalid
+        #if DEBUG
+        Serial.println("Error: response integrity check failed. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    } else if (sd->response.data.byte[3] & (unsigned int) supportedVoltage == 0x00) {
+        // If the 2nd-to-last byte of the reponse AND'ed with our host device's supported voltage
+        // range is 0x00, the SD card doesn't support our device's operating voltage
+        #if DEBUG
+        Serial.println("Fatal Error: unsupported voltage in use. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    }
+
+
+
+    /*
+    // (Optional) Ask for the card's supported voltage ranges
+    #if DEBUG
+    Serial.println("Checking SD Card's supported voltage ranges...");
+    #endif
+    sd->response.length = sendCmd(GETOCR, 0x00, sd->response.data.byte, 100, true);             // Read the OCR register
+
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+    if (res.response.qWord & (1 << SdOcr::IS_3_2V_TO_3_3V) || res.response.qWord & (1 << SdOcr::IS_3_2V_TO_3_3V)) {
+        #if DEBUG
+        Serial.println("Host voltage range supported by SD Card");
+        #endif
+    } else {
+        #if DEBUG
+        Serial.println("SD Card voltage range support unconfirmed. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    }
+    */
+
+
+
+    // Signal that the next command is a special, application-specific command
+    /*
+    #if DEBUG
+    Serial.println("Begin application-specific command...");
+    #endif
+    sd->response.length = sendCmd(ACBEGIN, 0x00, sd->response.data.byte, 0, true);
+
+    #if DEBUG
+    Serial.print("    Response:");
+    printResponse(res.response, sd->response.length, HEX);
+    #endif
+    if (sd->response.data.byte[0] & 0x01 != 0x01) {
+        #if DEBUG
+        Serial.println("Error: SD Card failed to acknowledge. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    }
+    */
+
+
+
+    // Indicate that the host supports SDHC/SDXC and wait for card to shift out of idle state
+    #if DEBUG
+    Serial.println("Expressing High-Capacity SD Card Support...");
+    #endif
+    tries = 0;
+    do {
+        //sd->response.length = sendCmd(ACINIT, 0x40000000, sd->response.data.byte, 100, true);     // New standard of sending host's op. conds.
+        sd->response.length = sendCmd(INIT, 0x40000000, sd->response.data.byte, 100, true);       // Send host's operating conditions
+        
+        tries++;
+    } while (tries < BUS_TIMEOUT && sd->response.data.byte[0] & 0x01);
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+    if (tries == BUS_TIMEOUT) {
+        #if DEBUG
+        Serial.println("Error: SD Card timed out. Aborting...");
+        #endif
+        sd->response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd->response.data.byte); // set CS high
+        return false;
+    }
+
+
+
+    // After card is ready, acquire card capacity info using GETOCR a second time
+    #if DEBUG
+    Serial.println("Reading Card Capacity Information...");
+    #endif
+    sd->response.length = sendCmd(GETOCR, 0x00, sd->response.data.byte, 100, true);                   // Read CCS
+    #if DEBUG
+    Serial.print("    Response: ");
+    printResponse(sd->response.data.byte, sd->response.length, HEX);
+    #endif
+    if (sd->response.data.byte[1] & 0x40) {
+        #if DEBUG
+        Serial.println("SD Card is HC/XC"); // The card is either high or extended capacity
+        #endif
+        sd->type = SDHC;
+    } else {
+        #if DEBUG
+        Serial.println("SD Card is SC");    // The card is standard capacity
+        #endif
+        sd->type = SDSC;
+    }
+
+    // Store OCR information
+    for (int i = 0; i < 4; i++) {
+        sd->ocr.byte[i] = sd->response.data.byte[i+1];   // ensure OCR doesn't capture the R1 section of the response
+    }
+
+    return true;
+}
+
+
+
 void processCmd(char* cmd) {
     if (strncmp(cmd, "help", CMDMAX) == 0) {
 
@@ -342,139 +552,70 @@ void processCmd(char* cmd) {
         Serial.println("echo");
 
     } else if (strncmp(cmd, "test", CMDMAX) == 0) {
-        SdResponse res;
-        SdType sdType;
-        int tries = 0;
-        bool cardIsIdle = false;
+        SdCard sd;
 
+        // Initialize the SD Card and store its properties in the sd variable
+        if (!initializeSdCard(&sd)) {
+            Serial.println("SD Card Init Failed...");
+            return;
+        } else {
 
+            // SD Card init success
+            //Serial.println("SD Card Init Complete!\nSD Card Properties:");
 
-        // Reset the card and force it to go to idle state at <400kHz with a CMD0 + (active-low) CS
-        Serial.println("Sending SD Card to Idle State...");
-        res.length = sendCmd(RESET, 0x00, res.response, 100, true);            // Reset the SD card
-        //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-
-
-
-        // Reset the card again to trigger SPI mode
-        Serial.print("Initializing SPI mode...");
-        do {
-            tries++;
-            Serial.print("Attempt #");
-            Serial.println(tries);
-            res.length = sendCmd(RESET, 0x00, res.response, 100, true);            // Reset the SD card
-            //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-    
-            // Check if R1 response frame's bit 1 is set (to ensure that card is in idle state)
-            if (res.response[0] & 0x01 == 0x01) {
-                // If it is, we can move on; otherwise, keep trying for a set amount of tries
-                cardIsIdle = true;
+            // Print SD Card info and supported operating conditions
+            /*
+            Serial.print("    OCR: ");
+            printResponse(sd.ocr.byte, 4, HEX);
+            Serial.println("        Supported Voltages:");
+            const uint32_t shiftedBit = 1;
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_DUAL_VOLTAGE)) {
+                Serial.println("Dual-Voltage Supported");
             }
-            delay(1000);
-        } while (tries < BUS_TIMEOUT && !cardIsIdle);
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-        if (tries >= BUS_TIMEOUT) {
-            Serial.println("Error: failed to initiate SPI mode within timeout. Aborting...");
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-            return;
-        }
-
-
-
-        // Send the host's supported voltage (3.3V) and ask if the card supports it
-        Serial.println("Checking Current SD Card Voltage Level...");
-        unsigned int checkPattern = 0xAB;
-        uint64_t supportedVoltage = 0x00000001;
-        res.length = sendCmd(GETOP, (supportedVoltage << 8) | checkPattern, res.response, 100, true);
-        //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-        if (res.response[4] != checkPattern) {
-            // If the last byte is not an exact echo of the LSB of the GETOP command's argument, this
-            // response is invalid
-            Serial.println("Error: response integrity check failed. Aborting...");
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-            return;
-        } else if (res.response[3] & (unsigned int) supportedVoltage == 0x00) {
-            // If the 2nd-to-last byte of the reponse AND'ed with our host device's supported voltage
-            // range is 0x00, the SD card doesn't support our device's operating voltage
-            Serial.println("Fatal Error: unsupported voltage in use. Aborting...");
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-            return;
-        }
-
-
-
-        /*
-        // (Optional) Ask for the card's supported voltage ranges
-        Serial.println("Checking SD Card's supported voltage ranges...");
-        res.length = sendCmd(GETOCR, 0x00, res.response, 100, true);             // Read the OCR register
-        //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-        uint32_t sdOcr = (uint32_t) res.response[5] << 0 |
-                         (uint32_t) res.response[4] << 8 |
-                         (uint32_t) res.response[3] << 16 |
-                         (uint32_t) res.response[2] << 24;
-        if (sdOcr & (1 << SdOcr::IS_3_2V_TO_3_3V) || sdOcr & (1 << SdOcr::IS_3_2V_TO_3_3V)) {
-            Serial.println("Host voltage range supported by SD Card");
-        } else {
-            Serial.println("SD Card voltage range support unconfirmed. Aborting...");
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-            return;
-        }
-        */
-
-
-
-        // Signal that the next command is a special, application-specific command
-//        Serial.println("Begin application-specific command...");
-//        res.length = sendCmd(ACBEGIN, 0x00, res.response, 0, true);
-//        //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-//        Serial.print("    Response:");
-//        printResponse(res.response, res.length, HEX);
-//        if (res.response[0] & 0x01 != 0x01) {
-//            Serial.println("Error: SD Card failed to acknowledge. Aborting...");
-//            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-//            return;
-//        }
-    
-    
-    
-        // Indicate that the host supports SDHC/SDXC and wait for card to shift out of idle state
-        Serial.println("Expressing High-Capacity SD Card Support...");
-        tries = 0;
-        do {
-            //res.length = sendCmd(ACINIT, 0x40000000, res.response, 100, true);     // New standard of sending host's op. conds.
-            res.length = sendCmd(INIT, 0x40000000, res.response, 100, true);       // Send host's operating conditions
-            //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-            tries++;
-        } while (tries < BUS_TIMEOUT && res.response[0] & 0x01);
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-        if (tries == BUS_TIMEOUT) {
-            Serial.println("Error: SD Card timed out. Aborting...");
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response); // set CS high
-            return;
-        }
-    
-    
-    
-        // After card is ready, acquire card capacity info using GETOCR a second time
-        Serial.println("Reading Card Capacity Information...");
-        res.length = sendCmd(GETOCR, 0x00, res.response, 100, true);                   // Read CCS
-        //res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);      // Send Garbage to acquire response
-        Serial.print("    Response: ");
-        printResponse(res.response, res.length, HEX);
-        if (res.response[1] & (1 << SdOcr::CCS)) {
-            Serial.println("SD Card is HC/XC"); // The card is either high or extended capacity
-            sdType = SDHC;
-        } else {
-            Serial.println("SD Card is SC");    // The card is standard capacity
-            sdType = SDSC;
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_1_8V_OK)) {
+                Serial.println("1.8V Switching Supported");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_2_7V_TO_2_8V)) {
+                Serial.println("2.7V - 2.8V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_2_8V_TO_2_9V)) {
+                Serial.println("2.8V - 2.9V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_2_9V_TO_3_0V)) {
+                Serial.println("2.9V - 3.0V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_0V_TO_3_1V)) {
+                Serial.println("3.0V - 3.1V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_1V_TO_3_2V)) {
+                Serial.println("3.1V - 3.2V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_2V_TO_3_3V)) {
+                Serial.println("3.2V - 3.3V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_3V_TO_3_4V)) {
+                Serial.println("3.3V - 3.4V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_4V_TO_3_5V)) {
+                Serial.println("3.4V - 3.5V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_3_5V_TO_3_6V)) {
+                Serial.println("3.5V - 3.6V");
+            }
+            if (sd.ocr.dWord & (shiftedBit << SdOcr::IS_UHS2)) {
+                Serial.println("Ultra-High-Speed II Supported");
+            }
+            
+            Serial.print("    Card Capacity Type: ");
+            switch (sd.type) {
+                case SDHC:
+                    Serial.println("SDHC/SDXC");
+                    break;
+                case SDSC:
+                    Serial.println("SDSC");
+                    break;
+            }
+            */
         }
     
         // TODO: Test Read from SD card
@@ -485,9 +626,9 @@ void processCmd(char* cmd) {
     
         // TEST: Write garbage
         for (int i = 0; i < 9; i++) {
-            res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0, true);
+            sd.response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd.response.data.byte, 0, true);
         }
-        res.length = sendCmd(GARBAGE, 0xFFFFFFFF, res.response, 0);
+        sd.response.length = sendCmd(GARBAGE, 0xFFFFFFFF, sd.response.data.byte, 0);
 
     } else if (strncmp(cmd, "test2", CMDMAX) == 0) {
 
