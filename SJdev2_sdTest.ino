@@ -85,8 +85,8 @@ typedef enum {    // NOTE: OR'ing of b0100_0000 is meant to conform with the SD 
     DEL_TO      = 0x40 | 33,    // CMD33: set address of the end block for deletion
     DEL         = 0x40 | 38,    // CMD38: begin deletion from the block range specified by the [DEL_FROM : DEL_TO] commands
     ACBEGIN     = 0x40 | 55,    // CMD55: signals the start of an application-specific command
-    GETOCR      = 0x40 | 58     // CMD58: request data from the operational conditions register
-    ACINIT      = 0x40 | 41,    // ACMD41: application-specific version of CMD1 (must precede with CMD55)
+    GETOCR      = 0x40 | 58,    // CMD58: request data from the operational conditions register
+    ACINIT      = 0x40 | 41     // ACMD41: application-specific version of CMD1 (must precede with CMD55)
 } SdCommand;
 
 
